@@ -1,0 +1,213 @@
+#!/bin/bash
+
+usage () {
+	cat 1>&2 <<EOF
+Usage: $0 [OPTION]... API_PATH
+Make an api call to the appserver
+
+OPTIONS:
+  -a,--advanced=PARAMS advanced querystring PARAMS to send
+  -c,--compact-json    retrieve compact json from the api
+  -d,--delete          DELETE a row
+  -f,--fields=LIST     specify a field list
+  -F,--filter=LIST     specify a filter list
+  -g,--get             GET a row (default)
+  -h,--help            show this help
+  -l,--limit=COUNT     limit result count
+  -n,--upload-name=N   override the filename for an upload
+  -o,--sort=FIELD      sort based on key[s]
+  -o,--offset=COUNT    skip first COUNT results
+  -p,--post=ROW        POST a row
+  -P,--put=ROW         PUT a row
+  -s,--password=PASS   user password
+  -S,--server=HOST     server to send command to (default: localhost)
+  -t,--threads=CNT     use CNT threads for uploads
+  -U,--upload=FILE     upload FILE to the server
+  -u,--user=USER       user login (default: admin)
+  -V,--version         show the version
+EOF
+
+}
+SHORTOPTS="a:cdf:F:ghl:n:o:O:p:P:s:S:t:u:U:V"
+LONGOPTS="advanced:,compact-json,delete,fields:,filter:,get,help,limit:,offset:,name:,post:,put:,password:,server:,sort:,threads:,upload:,user:,version"
+
+set -e
+GETOPTS="$(getopt -s bash -o $SHORTOPTS -l $LONGOPTS -n "$0" -- "${@}")"
+set +e
+
+eval set -- "$GETOPTS"
+VERSION=1.0
+USR=admin
+PASS=
+METHOD=GET
+ROW=
+UPLOAD=
+UPLOADNAME=
+FIELDS=
+FILTER=
+LIMIT=
+OFFSET=
+SORT=
+COMPACT=0
+THREADS=8
+SERVER=yb-api
+ADVANCED=
+
+while [ ${#} -gt 0 ]; do
+	case "$1" in
+		-a|--advanced) ADVANCED="$2"; shift ;;
+		-c|,--compact-json) COMPACT="1" ;;
+		-d|--delete) METHOD="delete" ;;
+		-f|--fields) FIELDS="$2"; shift ;;
+		-F|--filter) FILTER="$2"; shift ;;
+		-g|--get) METHOD="get" ;;
+		-h|--help) usage; exit 0 ;;
+		-l|--limit) LIMIT="$2"; shift ;;
+		-n|--upload-name) UPLOADNAME="$2"; shift ;;
+		-o|--sort) SORT="$2"; shift ;;
+		-O|--offset) OFFSET="$2"; shift ;;
+		-p|--post) METHOD="POST"; ROW="$2"; shift ;;
+		-P|--put) METHOD="PUT"; ROW="$2"; shift ;;
+		-s|--password) PASS="$2"; shift ;;
+		-S|--server) SERVER="$2"; shift ;;
+		-t|--threads) THREADS="$2"; shift ;;
+		-U|--upload) METHOD=UPLOAD; UPLOAD="$2"; shift ;;
+		-u|--user) USR="$2"; shift ;;
+		-V|--version) echo "$VERSION" ; exit 0 ;;
+		--) shift; break ;;
+		-*) echo 1>&2 "$0: Unknown option '$1'"; exit 1 ;;
+		*) echo 1>&2 "$0: Unknown option '$1'"; exit 1 ;;
+	esac
+	shift
+done
+
+kill_jobs() {
+	jobs -p | xargs kill
+	exit 1
+}
+
+urlencode() {
+	local string="${1}"
+	local strlen=${#string}
+	local encoded=""
+	local pos c o
+
+	for (( pos=0 ; pos<strlen ; pos++ )); do
+		c=${string:$pos:1}
+		case "$c" in
+			[-_.~a-zA-Z0-9]) o="${c}" ;;
+			*) printf -v o '%%%02x' "'$c" ;;
+		esac
+		encoded+="${o}"
+	done
+	echo -n "${encoded}"
+}
+
+if [ -z "$PASS" ]; then
+	if tty &> /dev/null ; then
+		read -p "Password: " -s -e PASS
+	fi
+	if [ -z "$PASS" ]; then
+		echo 1>&2 "$0: Password is required"
+		exit 1
+	fi
+fi
+if [ "${1#/}" = "${1}" ]; then
+	URL="https://${SERVER}/api/${1}"
+else
+	URL="https://${SERVER}/api${1}"
+fi
+OPTS=()
+case "$METHOD" in
+	POST|PUT)
+		OPTS[0]="--body-data"
+		OPTS[1]="${ROW}"
+		;;
+	DELETE|GET)
+		;;
+	UPLOAD)
+		if (( $THREADS >= 1 && $THREADS <= 24 )); then
+			:
+		else
+			echo 1>&2 "$0: Threads must be from 1 to 24"
+			exit 1
+		fi
+		if [ -z "$(which curl)" ]; then
+			echo 1>&2 "$0: curl is required for upload"
+			exit 1
+		fi
+		if [ -z "$UPLOAD" ]; then
+			echo 1>&2 "$0: Upload file is required"
+			exit 1
+		fi
+		if [ ! -e "$UPLOAD" ]; then
+			echo 1>&2 "$0: Upload file must exist"
+			exit 1
+		fi
+		[ -z "$UPLOADNAME" ] && UPLOADNAME="${UPLOAD##*/}"
+		UPLOAD="$(readlink -e "$UPLOAD")"
+		if [ $? -ne 0 ]; then
+			echo 1>&2 "$0: Upload file must exist"
+			exit 1
+		fi
+		if [ ! -f "$UPLOAD" ]; then
+			echo 1>&2 "$0: Can only upload regular files"
+			exit 1
+		fi
+		SIZE=$(stat -c %s "$UPLOAD")
+		FILEIDRESP="$(wget -q --http-user="$USR" --http-password="$PASS" --no-check-certificate -O - --method="POST" --header='Content-Type: application/json' "${URL}" --body-data "{\"allocated_bytes\":\"$SIZE\",\"name\":\"$UPLOADNAME\"${ADVANCED:+,${ADVANCED}}}")"
+		if [ $? -ne 0 -o -z "$FILEIDRESP" ]; then
+			echo 1>&2 "$0: Unable to post file '$UPLOADNAME': $FILEIDRESP"
+			exit 1
+		fi
+		FILEID="${FILEIDRESP%\"\}}"
+		FILEID="${FILEID##*/}"
+		BLOCKSIZE=262144
+		POS=0
+		CHUNKS=$(($SIZE / $BLOCKSIZE))
+		[ $(($SIZE % $BLOCKSIZE)) -gt 0 ] && let CHUNKS++
+		trap kill_jobs SIGINT
+
+		tty &> /dev/null && echo -en "\r[  0%]" 1>&2
+		while [ $POS -lt $CHUNKS ]; do
+			curl --header "Expect:" --basic --data-binary @<(dd if="$UPLOAD" bs=$BLOCKSIZE count=1 skip=$POS 2> /dev/null) --user "$USR:$PASS" --insecure --request "PUT" --header 'Content-Type: application/octet-stream' "${URL}/${FILEID}?filepos=$(($POS * $BLOCKSIZE))" &
+			let POS++
+			PERC=$(($POS * 100 / $CHUNKS))
+			while [ ${#PERC} -lt 3 ]; do
+				PERC=" $PERC"
+			done
+			tty &> /dev/null && echo -en "\r[$PERC%]" 1>&2
+			[ $POS -lt $THREADS ] && continue
+			wait -n
+			if [ $? -ne 0 ]; then
+				echo 1>&2 "$0: Error uploading file position $(($POS * $BLOCKSIZE))"
+				wait
+				exit 1
+			fi
+		done
+		wait
+		tty &> /dev/null && echo 1>&2
+		echo "$FILEIDRESP"
+		exit 0
+		;;
+esac
+
+QS="${FIELDS:+&fields=$(urlencode "${FIELDS}")}${FILTER:+&filter=$(urlencode "${FILTER}")}${SORT:+&sort=$(urlencode "${SORT}")}${LIMIT:+&limit=$(urlencode "${LIMIT}")}${OFFSET:+&offset=$(urlencode "${OFFSET}")}${ADVANCED:+&${ADVANCED}}"
+QS="${QS:1}"
+TMPFILE=$(mktemp --suffix=.yb-api)
+HDR=
+[ "$COMPACT" = 0 ] && HDR="--header=X-JSON-Non-Compact:1"
+OUT=$(wget --content-on-error -nv --http-user="$USR" --http-password="$PASS" --no-check-certificate -O - --method="${METHOD}" ${HDR} --header='Content-Type: application/json' "${OPTS[@]}" "${URL}${QS:+?${QS}}" 2> "$TMPFILE")
+RET=$?
+if [ $RET -ne 0 ]; then
+	if [ -z "$OUT" ]; then
+		grep -vE -e '^WARNING' -e '^The certificate' "$TMPFILE" 1>&2
+	else
+		echo "$OUT" 1>&2
+	fi
+else
+	echo "$OUT"
+	tty &> /dev/null && echo
+fi
+rm -f "$TMPFILE"
+exit $RET

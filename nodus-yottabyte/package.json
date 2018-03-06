@@ -1,0 +1,11 @@
+{
+  "name": "nodus-yodabyte",
+  "version": "1.0.0",
+  "description": "NODUS Yodabyte Extension",
+  "main": "app.js",
+  "scripts": {
+  },
+  "keywords": ["nodus", "nodus-cloud-bursting", "nodus-platform"],
+  "author": "Brad Serbu",
+  "license": "ISC"
+}
